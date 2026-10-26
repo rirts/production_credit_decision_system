@@ -52,3 +52,25 @@ def test_explain():
     assert "top_positive_factors" in data
     assert "top_negative_factors" in data
     assert isinstance(data["shap_values"], list)
+    assert len(data["shap_values"]) == len(sample_input)
+    assert abs(data["base_value"] + sum(data["shap_values"]) - data["default_probability"]) < 1e-6
+
+def test_invalid_input_is_rejected():
+    assert client.post("/predict", json={**sample_input, "age": -1}).status_code == 422
+    assert client.post("/predict", json={**sample_input, "purpose": "unknown"}).status_code == 422
+
+
+def test_untrained_service_returns_actionable_503(monkeypatch, tmp_path):
+    monkeypatch.setenv("CREDIT_MODEL_DIR", str(tmp_path / "untrained"))
+    for endpoint in ("/predict", "/explain"):
+        response = client.post(endpoint, json=sample_input)
+        assert response.status_code == 503
+        assert "python -m src.models.train" in response.json()["detail"]
+
+
+def test_profit_contract_rewards_approved_good_loans():
+    from src.models.train import business_profit
+
+    # Two approved good loans, one approved default, one rejected good loan,
+    # and one correctly rejected default: 30,000 - 10,000 - 5,000.
+    assert business_profit([0, 0, 1, 0, 1], [0, 0, 0, 1, 1]) == 15000

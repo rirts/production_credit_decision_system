@@ -5,3 +5,6 @@ __pycache__/
 .env
 models/*.pkl
 data/*.csv
+models/*.joblib
+.pytest_cache/
+data/predictions_log.csv

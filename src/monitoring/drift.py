@@ -5,12 +5,13 @@ import joblib
 
 
 def load_train_scores():
-    path = Path("models/train_scores.pkl")
-    return joblib.load(path)
+    from src.artifacts import load_bundle
+    return load_bundle()["train_scores"]
 
 
 def load_production_scores():
-    path = Path("data/predictions_log.csv")
+    from src.monitoring.metrics import LOG_PATH
+    path = LOG_PATH
     
     if not path.exists():
         raise FileNotFoundError("No production data found")
@@ -21,9 +22,15 @@ def load_production_scores():
 def calculate_psi(expected, actual, bins=10):
     expected = np.array(expected)
     actual = np.array(actual)
+    if not len(expected) or not len(actual) or not np.isfinite(expected).all() or not np.isfinite(actual).all():
+        raise ValueError("PSI requires non-empty finite scores")
 
     breakpoints = np.linspace(0, 100, bins + 1)
-    breakpoints = np.percentile(expected, breakpoints)
+    breakpoints = np.unique(np.percentile(expected, breakpoints))
+    if len(breakpoints) < 2:
+        breakpoints = np.array([-np.inf, float(expected[0]), np.inf])
+    else:
+        breakpoints[0], breakpoints[-1] = -np.inf, np.inf
 
     expected_counts, _ = np.histogram(expected, bins=breakpoints)
     actual_counts, _ = np.histogram(actual, bins=breakpoints)

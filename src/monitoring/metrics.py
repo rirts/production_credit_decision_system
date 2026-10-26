@@ -1,7 +1,9 @@
 import pandas as pd
 from pathlib import Path
 
-LOG_PATH = Path("data/predictions_log.csv")
+from src.artifacts import ROOT
+import os
+LOG_PATH = Path(os.getenv("CREDIT_LOG_PATH", str(ROOT / "data/predictions_log.csv")))
 
 
 def load_predictions():
@@ -16,10 +18,10 @@ def load_predictions():
 
 def compute_basic_metrics(df: pd.DataFrame):
     total = len(df)
-    approvals = int(df["decision"].sum())
+    approvals = int(df["decision"].eq(0).sum())
     
     approval_rate = float(approvals / total) if total > 0 else 0.0
-    avg_risk = float(df["prediction_proba"].mean())
+    avg_risk = float(df["prediction_proba"].mean()) if total else 0.0
 
     return {
         "total_predictions": int(total),
@@ -32,7 +34,7 @@ def risk_distribution(df: pd.DataFrame):
     bins = [0, 0.2, 0.4, 0.6, 0.8, 1]
     labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"]
 
-    df["risk_bucket"] = pd.cut(df["prediction_proba"], bins=bins, labels=labels)
+    df["risk_bucket"] = pd.cut(df["prediction_proba"], bins=bins, labels=labels, include_lowest=True)
 
     distribution = df["risk_bucket"].value_counts().sort_index()
 
