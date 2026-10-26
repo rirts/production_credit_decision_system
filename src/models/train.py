@@ -3,7 +3,7 @@ import pandas as pd
 import joblib
 from pathlib import Path
 
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -14,20 +14,25 @@ from sklearn.base import clone
 from xgboost import XGBClassifier
 
 from src.data.load_data import load_data
+from src.artifacts import ROOT, artifact_path
+import os
+import tempfile
+import hashlib
+from datetime import datetime, timezone
 
 # Paths
-DATA_PATH = "data/raw/german.data"
-MODEL_DIR = Path("models")
-MODEL_DIR.mkdir(exist_ok=True)
+DATA_PATH = ROOT / "data/raw/german.data"
+MODEL_DIR = artifact_path().parent
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 # Business parameters
-PROFIT_TP = 15000
+PROFIT_TN = 15000  # approved good loan; demo utility units, not validated business profit
 COST_FN = 10000
 COST_FP = 5000
 
 def business_profit(y_true, y_pred):
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    return tp * PROFIT_TP - fn * COST_FN - fp * COST_FP
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return tn * PROFIT_TN - fn * COST_FN - fp * COST_FP
 
 def optimize_threshold(y_true, y_proba):
     best_t = 0
@@ -81,7 +86,7 @@ def train():
         ('preprocessor', preprocessor),
         ('model', XGBClassifier(
             random_state=42,
-            eval_metric='logloss'
+            eval_metric='logloss', n_jobs=1
         ))
     ])
 
@@ -101,14 +106,27 @@ def train():
 
     print("Saving artifacts...")
 
-    joblib.dump(calibrated_model, MODEL_DIR / "model.pkl")
-    joblib.dump(threshold, MODEL_DIR / "threshold.pkl")
-
-    # SHAP background
-    sample = X.sample(100, random_state=42)
-    transformed = pipeline.named_steps['preprocessor'].fit(X).transform(sample)
-
-    joblib.dump(transformed, MODEL_DIR / "background.pkl")
+    encoders = {col: sorted(X[col].astype(str).unique().tolist()) for col in cat_cols}
+    numeric = X.sample(10, random_state=42).copy()
+    for col, values in encoders.items():
+        numeric[col] = numeric[col].map({v: i for i, v in enumerate(values)})
+    bundle = {
+        "schema_version": 1, "model": calibrated_model, "threshold": float(threshold),
+        "train_scores": calibrated_model.predict_proba(X)[:, 1],
+        "feature_names": X.columns.tolist(), "numeric_columns": num_cols,
+        "category_encoders": encoders, "background": numeric.to_numpy(dtype=float),
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "training_sha256": hashlib.sha256(Path(DATA_PATH).read_bytes()).hexdigest(),
+        "positive_class": "default", "decision_one_means": "reject",
+        "fairness_mitigation_applied": False,
+    }
+    fd, temporary = tempfile.mkstemp(dir=MODEL_DIR, suffix=".joblib")
+    os.close(fd)
+    try:
+        joblib.dump(bundle, temporary)
+        os.replace(temporary, artifact_path())
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
     print("Training complete.")
 

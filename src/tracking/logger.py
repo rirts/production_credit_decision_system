@@ -1,10 +1,10 @@
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.tracking.mappings import ALL_MAPPINGS
 
-LOG_PATH = Path("data/predictions_log.csv")
+from src.monitoring.metrics import LOG_PATH
 
 
 def enrich_with_mappings(input_data: dict) -> dict:
@@ -31,7 +31,7 @@ def log_prediction(input_data: dict, proba: float, decision: int):
         **enriched_data,
         "prediction_proba": float(proba),
         "decision": int(decision),
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
     df = pd.DataFrame([record])

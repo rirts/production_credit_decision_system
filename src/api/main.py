@@ -1,210 +1,101 @@
+"""Credit decision demo: positive class is default; decision=1 means reject."""
 from fastapi import FastAPI, HTTPException
+import numpy as np
+import pandas as pd
+import shap
+from src.api.schemas import CreditInput
+from src.artifacts import load_bundle
 from src.tracking.logger import log_prediction
-from src.monitoring.metrics import (
-    load_predictions,
-    compute_basic_metrics,
-    risk_distribution
-)
+from src.monitoring.metrics import load_predictions, compute_basic_metrics, risk_distribution
 from src.monitoring.drift import detect_drift
 from src.monitoring.alerts import evaluate_alerts
 from src.reporting.summary import generate_summary
-import pandas as pd
-import joblib
-import shap
-import logging
-
-from src.api.schemas import CreditInput
-
-# Logging primero
-logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
-# Load artifacts
-model = joblib.load("models/model.pkl")
-background = joblib.load("models/background.pkl")
-THRESHOLD = joblib.load("models/threshold.pkl")
+def bundle_or_503():
+    try:
+        return load_bundle()
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(503, "Train a compatible bundle with python -m src.models.train") from exc
 
-try:
-    base_pipeline = model.calibrated_classifiers_[0].estimator
-
-    tree_model = base_pipeline.named_steps['model']
-    preprocessor = base_pipeline.named_steps['preprocessor']
-
-    explainer = shap.TreeExplainer(tree_model)
-
-except Exception as e:
-    logging.error(f"Error initializing SHAP explainer: {e}")
-    explainer = None
-
+def frame(data, bundle):
+    return pd.DataFrame([data.model_dump()])[bundle["feature_names"]]
 
 @app.get("/")
 def root():
-    return {"message": "Credit Scoring API running"}
+    return {"message": "Credit decision demo", "decision_contract": "0=approve, 1=reject"}
 
-
-# Predict
 @app.post("/predict")
 def predict(data: CreditInput):
-    try:
-        df = pd.DataFrame([data.dict()])
-        
-        proba = model.predict_proba(df)[0][1]
-        prediction = int(proba >= THRESHOLD)
+    b = bundle_or_503()
+    proba = float(b["model"].predict_proba(frame(data, b))[0, 1])
+    decision = int(proba >= b["threshold"])
+    log_prediction(data.model_dump(), proba, decision)
+    return {"default_probability": proba, "prediction": decision,
+            "decision": "reject" if decision else "approve", "threshold": b["threshold"]}
 
-        logging.info(f"Prediction: {proba}")
-
-        # NUEVO: tracking
-        log_prediction(
-            input_data=data.dict(),
-            proba=proba,
-            decision=prediction
-        )
-
-        return {
-            "default_probability": float(proba),
-            "prediction": prediction
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# Explain
 @app.post("/explain")
 def explain(data: CreditInput):
+    b = bundle_or_503()
+    x = frame(data, b)
+    encoded = x.copy()
+    for col, categories in b["category_encoders"].items():
+        if x.iloc[0][col] not in categories:
+            raise HTTPException(422, f"No explanation encoding for category in {col}")
+        encoded[col] = encoded[col].map({v: i for i, v in enumerate(categories)})
+
+    def predict_default(values):
+        decoded = pd.DataFrame(values, columns=b["feature_names"])
+        for col, categories in b["category_encoders"].items():
+            decoded[col] = [categories[int(v)] for v in decoded[col]]
+        for col in b["numeric_columns"]:
+            decoded[col] = pd.to_numeric(decoded[col])
+        return b["model"].predict_proba(decoded)[:, 1]
+
+    # Numeric category codes are swapped, not interpolated: explanations target the
+    # same calibrated ensemble probability used by /predict, not one base tree.
+    explainer = shap.PermutationExplainer(predict_default, b["background"], seed=42)
+    result = explainer(encoded.to_numpy(dtype=float), max_evals=2 * len(b["feature_names"]) + 1)
+    impacts = np.asarray(result.values[0], dtype=float)
+    factors = [{"feature": col, "impact": float(v)} for col, v in zip(b["feature_names"], impacts)]
+    return {"explanation_target": "calibrated_default_probability",
+            "base_value": float(np.asarray(result.base_values).reshape(-1)[0]),
+            "default_probability": float(b["model"].predict_proba(x)[0, 1]),
+            "feature_names": b["feature_names"], "shap_values": impacts.tolist(),
+            "top_positive_factors": sorted([v for v in factors if v["impact"] > 0], key=lambda v: -v["impact"])[:5],
+            "top_negative_factors": sorted([v for v in factors if v["impact"] < 0], key=lambda v: v["impact"])[:5]}
+
+def monitoring_payload():
     try:
-        if explainer is None:
-            raise HTTPException(status_code=500, detail="Explainer not initialized")
-
-        df = pd.DataFrame([data.dict()])
-        
-        # usar preprocessor correcto
-        X_transformed = preprocessor.transform(df)
-
-        feature_names = preprocessor.get_feature_names_out()
-        
-        shap_values = explainer(X_transformed)
-
-        shap_values_array = shap_values.values[0]
-
-        def clean_feature_name(name):
-            if "__" in name:
-                name = name.split("__")[1]
-            if "_" in name:
-                parts = name.split("_")
-                return f"{parts[0]} = {parts[-1]}"
-            return name
-
-        feature_impact = [
-            (clean_feature_name(f), v)
-            for f, v in zip(feature_names, shap_values_array)
-        ]
-
-        # Orden por impacto positivo (riesgo ↑)
-        top_positive = sorted(feature_impact, key=lambda x: x[1], reverse=True)[:5]
-
-        # Orden por impacto negativo (riesgo ↓)
-        top_negative = sorted(feature_impact, key=lambda x: x[1])[:5]
-
-        top_positive_factors = [
-           {"feature": f, "impact": float(v)} for f, v in top_positive
-        ]
-
-        top_negative_factors = [
-            {"feature": f, "impact": float(v)} for f, v in top_negative
-        ]
-        
-        return {
-            "top_positive_factors": top_positive_factors,
-            "top_negative_factors": top_negative_factors
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        df = load_predictions()
+    except FileNotFoundError:
+        df = pd.DataFrame(columns=["decision", "prediction_proba"])
+    metrics = {**compute_basic_metrics(df), "risk_distribution": risk_distribution(df)}
+    try:
+        drift = detect_drift()
+    except FileNotFoundError:
+        drift = {"psi": None, "status": "no_data"}
+    alerts = evaluate_alerts(metrics, drift) if metrics["total_predictions"] else []
+    return metrics, drift, alerts
 
 @app.get("/metrics")
 def get_metrics():
-    try:
-        df = load_predictions()
-
-        basic = compute_basic_metrics(df)
-        dist = risk_distribution(df)
-
-        return {
-            **basic,
-            "risk_distribution": dist
-        }
-
-    except FileNotFoundError:
-        return {
-            "total_predictions": 0,
-            "approval_rate": 0.0,
-            "average_risk": 0.0,
-            "risk_distribution": {}
-        }
-
-    except Exception as e:
-        logging.error(f"Metrics error: {e}")
-        raise HTTPException(status_code=500, detail="Error computing metrics")
+    return monitoring_payload()[0]
 
 @app.get("/drift")
 def get_drift():
-    try:
-        result = detect_drift()
-        return result
+    return monitoring_payload()[1]
 
-    except FileNotFoundError:
-        return {
-            "psi": None,
-            "status": "no_data"
-        }
-
-    except Exception as e:
-        logging.error(f"Drift error: {e}")
-        raise HTTPException(status_code=500, detail="Error computing drift")
-    
 @app.get("/health")
 def system_health():
-    try:
-        df = load_predictions()
-
-        metrics = compute_basic_metrics(df)
-        metrics["risk_distribution"] = risk_distribution(df)
-
-        drift = detect_drift()
-
-        alerts = evaluate_alerts(metrics, drift)
-
-        return {
-            "metrics": metrics,
-            "drift": drift,
-            "alerts": alerts,
-            "status": "ok" if len(alerts) == 0 else "warning"
-        }
-
-    except Exception as e:
-        logging.error(f"Health check error: {e}")
-        raise HTTPException(status_code=500, detail="Error computing system health")
+    metrics, drift, alerts = monitoring_payload()
+    return {"metrics": metrics, "drift": drift, "alerts": alerts,
+            "status": "no_data" if not metrics["total_predictions"] else ("warning" if alerts else "ok")}
 
 @app.get("/report")
 def get_report():
-    try:
-        df = load_predictions()
-
-        metrics = compute_basic_metrics(df)
-        metrics["risk_distribution"] = risk_distribution(df)
-
-        drift = detect_drift()
-        alerts = evaluate_alerts(metrics, drift)
-
-        summary = generate_summary(metrics, drift, alerts)
-
-        return {
-            "summary": summary["summary"],
-            "status": "ok" if len(alerts) == 0 else "warning"
-        }
-
-    except Exception as e:
-        logging.error(f"Report error: {e}")
-        raise HTTPException(status_code=500, detail="Error generating report")
+    metrics, drift, alerts = monitoring_payload()
+    if not metrics["total_predictions"]:
+        return {"summary": "No decisions have been recorded.", "status": "no_data"}
+    return {**generate_summary(metrics, drift, alerts), "status": "warning" if alerts else "ok"}
